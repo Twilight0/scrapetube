@@ -227,9 +227,12 @@ def get_video(
     )["client"]
     session.headers["X-YouTube-Client-Name"] = "1"
     session.headers["X-YouTube-Client-Version"] = client["clientVersion"]
-    data = json.loads(
-        get_json_from_html(html, "var ytInitialData = ", 0, "};") + "}"
-    )
+    data = _extract_yt_initial_data(html)
+    if data is None:
+        raise RuntimeError(
+            "Could not find video data in YouTube response "
+            "(page layout changed or login expired)"
+        )
     return next(search_dict(data, "videoPrimaryInfoRenderer"))
 
 def get_videos(
@@ -248,9 +251,12 @@ def get_videos(
             api_key = get_json_from_html(html, "innertubeApiKey", 3)
             session.headers["X-YouTube-Client-Name"] = "1"
             session.headers["X-YouTube-Client-Version"] = client["clientVersion"]
-            data = json.loads(
-                get_json_from_html(html, "var ytInitialData = ", 0, "};") + "}"
-            )
+            data = _extract_yt_initial_data(html)
+            if data is None:
+                raise RuntimeError(
+                    "Could not find page data in YouTube response "
+                    "(page layout changed or login expired)"
+                )
 
             # Do not parse the channel Home page when the requested tab does not exist
             # or is not the selected tab (merged peoyli + ahai72160 logic).
@@ -403,6 +409,36 @@ def get_ajax_data(
         headers=_get_auth_headers(session),
     )
     return response.json()
+
+def _extract_yt_initial_data(html: str):
+    """Parse embedded page data across YouTube layouts.
+
+    Logged-in pages embed JSON in
+    ``<script id="yt-initial-data" type="application/json">...</script>``;
+    anonymous pages use ``var ytInitialData = {...};``.
+    Returns the parsed dict, or ``None`` when neither is found.
+    """
+    marker = 'id="yt-initial-data"'
+    pos = html.find(marker)
+    if pos != -1:
+        start = html.find(">", pos) + 1
+        end = html.find("</script>", start)
+        if start > 0 and end > start:
+            try:
+                return json.loads(html[start:end])
+            except ValueError:
+                pass
+    legacy_key = "var ytInitialData = "
+    pos = html.find(legacy_key)
+    if pos != -1:
+        try:
+            return json.loads(
+                get_json_from_html(html, legacy_key, 0, "};") + "}"
+            )
+        except ValueError:
+            pass
+    return None
+
 
 def get_json_from_html(html: str, key: str, num_chars: int = 2, stop: str = '"') -> str:
     pos_begin = html.find(key) + len(key) + num_chars
