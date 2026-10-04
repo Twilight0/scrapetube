@@ -3,7 +3,11 @@ import time
 from typing import Generator
 
 import requests
-from typing_extensions import Literal
+
+try:
+    from typing_extensions import Literal
+except ImportError:  # Kodi / minimal envs without typing_extensions
+    Literal = str
 
 type_property_map = {
     "videos": "videoRenderer",
@@ -49,7 +53,7 @@ def get_channel(
         proxies (``dict``, *optional*):
             A dictionary with the proxies you want to use. Ex:
             ``{'https': 'http://username:password@101.102.103.104:3128'}``
-        
+
         sort_by (``str``, *optional*):
             In what order to retrieve to videos. Pass one of the following values.
             ``"newest"``: Get the new videos first.
@@ -61,6 +65,9 @@ def get_channel(
             ``"videos"``: Videos
             ``"shorts"``: Shorts
             ``"streams"``: Streams
+
+    Each yielded item keeps the upstream dict shape and additionally provides
+    ``title_text`` (``str``) and ``is_live`` (``bool``) for convenience.
     """
 
     base_url = ""
@@ -71,15 +78,14 @@ def get_channel(
     elif channel_username:
         base_url = f"https://www.youtube.com/@{channel_username}"
 
-    url = "{base_url}/{content_type}?view=0&flow=grid".format(
+    url = "{base_url}/{content_type}?view=2".format(
         base_url=base_url,
         content_type=content_type,
     )
     api_endpoint = "https://www.youtube.com/youtubei/v1/browse"
-    videos = get_videos(url, api_endpoint, "contents", type_property_map[content_type], limit, sleep, proxies, sort_by)
+    videos = get_videos(url, api_endpoint, "contents", type_property_map[content_type], limit, sleep, proxies, sort_by, content_type)
     for video in videos:
         yield video
-
 
 def get_playlist(
     playlist_id: str, limit: int = None, sleep: int = 1, proxies: dict = None
@@ -97,7 +103,7 @@ def get_playlist(
         sleep (``int``, *optional*):
             Seconds to sleep between API calls to youtube, in order to prevent getting blocked.
             Defaults to 1.
-        
+
         proxies (``dict``, *optional*):
             A dictionary with the proxies you want to use. Ex:
             ``{'https': 'http://username:password@101.102.103.104:3128'}``
@@ -105,10 +111,15 @@ def get_playlist(
 
     url = f"https://www.youtube.com/playlist?list={playlist_id}"
     api_endpoint = "https://www.youtube.com/youtubei/v1/browse"
-    videos = get_videos(url, api_endpoint, "playlistVideoListRenderer", "playlistVideoRenderer", limit, sleep, proxies)
+
+    # YouTube migrated playlist pages from the old "playlistVideoListRenderer"
+    # container to "itemSectionRenderer" wrapping richItemRenderer/lockupViewModel
+    # nodes. The old selector no longer matches anything on current pages.
+    videos = get_videos(
+        url, api_endpoint, "itemSectionRenderer", "playlistVideoRenderer", limit, sleep, proxies
+    )
     for video in videos:
         yield video
-
 
 def get_search(
     query: str,
@@ -143,11 +154,10 @@ def get_search(
         results_type (``str``, *optional*):
             What type you want to search for. Pass one of the following values:
             ``"video"|"channel"|"playlist"|"movie"``. Defaults to "video".
-        
+
         proxies (``dict``, *optional*):
             A dictionary with the proxies you want to use. Ex:
             ``{'https': 'http://username:password@101.102.103.104:3128'}``
-
     """
 
     sort_by_map = {
@@ -173,8 +183,6 @@ def get_search(
     for video in videos:
         yield video
 
-
-
 def get_video(
     id: str,
 ) -> dict:
@@ -199,10 +207,8 @@ def get_video(
     )
     return next(search_dict(data, "videoPrimaryInfoRenderer"))
 
-
-
 def get_videos(
-    url: str, api_endpoint: str, selector_list: str, selector_item: str, limit: int, sleep: float, proxies: dict = None, sort_by: str = None
+    url: str, api_endpoint: str, selector_list: str, selector_item: str, limit: int, sleep: float, proxies: dict = None, sort_by: str = None, content_type: str = None
 ) -> Generator[dict, None, None]:
     session = get_session(proxies)
     is_first = True
@@ -220,17 +226,59 @@ def get_videos(
             data = json.loads(
                 get_json_from_html(html, "var ytInitialData = ", 0, "};") + "}"
             )
-            data = next(search_dict(data, selector_list), None)
+
+            # Do not parse the channel Home page when the requested tab does not exist
+            # or is not the selected tab (merged peoyli + ahai72160 logic).
+            if content_type:
+                tabs = next(search_dict(data, "tabs"), [])
+                matched = False
+                for tab in tabs:
+                    renderer = tab.get("tabRenderer", {})
+                    tab_url = (
+                        renderer.get("endpoint", {})
+                        .get("commandMetadata", {})
+                        .get("webCommandMetadata", {})
+                        .get("url", "")
+                    )
+                    if tab_url.endswith("/" + content_type) and renderer.get("selected"):
+                        matched = True
+                        break
+                if not matched:
+                    return
+
+            if selector_list == "itemSectionRenderer":
+                # Playlist pages contain several itemSectionRenderer nodes
+                # (comments, related, etc.). next() would grab the first,
+                # which is usually empty — pick the one holding video items.
+                best = None
+                best_count = -1
+                for candidate in search_dict(data, selector_list):
+                    n = sum(
+                        1 for _ in search_dict(candidate, "lockupViewModel")
+                    ) + sum(
+                        1 for _ in search_dict(candidate, "richItemRenderer")
+                    ) + sum(
+                        1 for _ in search_dict(candidate, "playlistVideoRenderer")
+                    )
+                    if n > best_count:
+                        best_count = n
+                        best = candidate
+                data = best
+            else:
+                data = next(search_dict(data, selector_list), None)
             next_data = get_next_data(data, sort_by)
             is_first = False
-            if sort_by and sort_by != "newest": 
+            if sort_by and sort_by != "newest":
                 continue
         else:
             data = get_ajax_data(session, api_endpoint, api_key, next_data, client)
             next_data = get_next_data(data)
+
         for result in get_videos_items(data, selector_item):
             try:
                 count += 1
+                if content_type is not None:
+                    result = _enrich_channel_item(result)
                 yield result
                 if count == limit:
                     quit_it = True
@@ -246,7 +294,6 @@ def get_videos(
 
     session.close()
 
-
 def get_session(proxies: dict = None) -> requests.Session:
     session = requests.Session()
     if proxies:
@@ -254,16 +301,16 @@ def get_session(proxies: dict = None) -> requests.Session:
     session.headers[
         "User-Agent"
     ] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    # Note: YouTube may auto-translate titles/descriptions based on this.
+    # Keep "en" for stable results; see README for details.
     session.headers["Accept-Language"] = "en"
     return session
 
 def get_initial_data(session: requests.Session, url: str) -> str:
     session.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
     response = session.get(url, params={"ucbcb":1})
-
     html = response.text
     return html
-
 
 def get_ajax_data(
     session: requests.Session,
@@ -279,34 +326,106 @@ def get_ajax_data(
     response = session.post(api_endpoint, params={"key": api_key}, json=data)
     return response.json()
 
-
 def get_json_from_html(html: str, key: str, num_chars: int = 2, stop: str = '"') -> str:
     pos_begin = html.find(key) + len(key) + num_chars
     pos_end = html.find(stop, pos_begin)
     return html[pos_begin:pos_end]
 
-
 def get_next_data(data: dict, sort_by: str = None) -> dict:
     # Youtube, please don't change the order of these
     sort_by_map = {
-        "newest": 0, 
+        "newest": 0,
         "popular": 1,
-        "oldest": 2, 
+        "oldest": 2,
     }
     if sort_by and sort_by != "newest":
+        # 1) Current chipBarViewModel layout (ahai72160), including the
+        # showSheetCommand variant used on channels with memberships enabled.
+        chip_bar = next(search_dict(data, "chipBarViewModel"), None)
+        if chip_bar is not None:
+            try:
+                chips = chip_bar.get("chips", [])
+                if chips:
+                    first_cmd = (
+                        chips[0].get("chipViewModel", {})
+                        .get("tapCommand", {})
+                        .get("innertubeCommand", {})
+                    )
+                    if "showSheetCommand" in first_cmd:
+                        list_items = next(search_dict(first_cmd, "listItems"), None)
+                        if list_items:
+                            cmd = list_items[sort_by_map[sort_by]][
+                                "listItemViewModel"
+                            ]["rendererContext"]["commandContext"]["onTap"][
+                                "innertubeCommand"
+                            ]
+                            token = None
+                            click_params = None
+                            for command in cmd.get("commandExecutorCommand", {}).get(
+                                "commands", []
+                            ):
+                                token = _safe_get(
+                                    command, "continuationCommand", "token"
+                                )
+                                if token is not None:
+                                    click_params = command.get("clickTrackingParams")
+                                    break
+                            if token:
+                                return {
+                                    "token": token,
+                                    "click_params": {
+                                        "clickTrackingParams": click_params
+                                    },
+                                }
+                    else:
+                        endpoint = chips[sort_by_map[sort_by]]["chipViewModel"][
+                            "tapCommand"
+                        ]["innertubeCommand"]
+                        if endpoint and "continuationCommand" in endpoint:
+                            return {
+                                "token": endpoint["continuationCommand"]["token"],
+                                "click_params": {
+                                    "clickTrackingParams": endpoint.get(
+                                        "clickTrackingParams"
+                                    )
+                                },
+                            }
+            except (KeyError, IndexError, TypeError, AttributeError):
+                pass
+        # 2) Legacy feedFilterChipBarRenderer layout (original / peoyli).
+        try:
+            feed = next(search_dict(data, "feedFilterChipBarRenderer"), None)
+            if feed:
+                endpoint = feed["contents"][sort_by_map[sort_by]][
+                    "chipCloudChipRenderer"
+                ]["navigationEndpoint"]
+                if endpoint and "continuationCommand" in endpoint:
+                    return {
+                        "token": endpoint["continuationCommand"]["token"],
+                        "click_params": {
+                            "clickTrackingParams": endpoint.get("clickTrackingParams")
+                        },
+                    }
+        except (KeyError, IndexError, TypeError, AttributeError):
+            pass
+        return None
+    endpoint = next(search_dict(data, "continuationEndpoint"), None)
+    if not endpoint:
         endpoint = next(
-            search_dict(data, "feedFilterChipBarRenderer"), None)["contents"][sort_by_map[sort_by]]["chipCloudChipRenderer"]["navigationEndpoint"]
-    else:
-        endpoint = next(search_dict(data, "continuationEndpoint"), None)
+            (c for c in search_dict(data, "innertubeCommand") if "continuationCommand" in c),
+            None
+        )
+
     if not endpoint:
         return None
+
+    token = endpoint["continuationCommand"]["token"]
     next_data = {
-        "token": endpoint["continuationCommand"]["token"],
-        "click_params": {"clickTrackingParams": endpoint["clickTrackingParams"]},
+        "token": token,
+        "click_params": {"clickTrackingParams": endpoint.get("clickTrackingParams")},
     }
 
     return next_data
-
 
 def search_dict(partial: dict, search_key: str) -> Generator[dict, None, None]:
     stack = [partial]
@@ -322,6 +441,213 @@ def search_dict(partial: dict, search_key: str) -> Generator[dict, None, None]:
             for value in current_item:
                 stack.append(value)
 
+def parse_rich_item_new_format(rich_item: dict) -> dict:
+    """Parse richItemRenderer wrapper (used on channel pages)."""
+    content = rich_item.get("content", {})
+    lockup_view = content.get("lockupViewModel", {})
+    if lockup_view:
+        return parse_lockup_view_model(lockup_view)
+    return None
+
+def parse_lockup_view_model(lockup_view: dict) -> dict:
+    """Parse a lockupViewModel dict directly (used by both channels and playlists)."""
+    try:
+        # Try the simple, direct approach first, get videoId from contentId
+        video_id = lockup_view.get("contentId")
+        content_type = lockup_view.get("contentType", "")
+
+        # Only proceed if this is actually a video
+        if content_type and content_type != "LOCKUP_CONTENT_TYPE_VIDEO":
+            return None
+
+        # Fallback: search for watchEndpoint if still no videoId
+        if not video_id:
+            for endpoint in search_dict(lockup_view, "watchEndpoint"):
+                video_id = endpoint.get("videoId")
+                if video_id:
+                    break
+
+        if not video_id:
+            return None
+
+        metadata = lockup_view.get("metadata", {})
+        lockup_metadata = metadata.get("lockupMetadataViewModel", {})
+
+        # Extract title
+        title = lockup_metadata.get("title", {}).get("content", "")
+
+        # Extract thumbnail URL
+        thumbnail_url = None
+        content_image = lockup_view.get("contentImage", {})
+        sources = content_image.get("thumbnailViewModel", {}).get("image", {}).get("sources", [])
+        if sources:
+            thumbnail_url = sources[-1].get("url")
+
+        # Extract metadata rows (channel name, views, upload time)
+        channel_name = None
+        views = None
+        upload_time = None
+
+        meta_rows = lockup_metadata.get("metadata", {}).get("contentMetadataViewModel", {}).get("metadataRows", [])
+
+        if len(meta_rows) == 1:
+            # Channel pages: single row is views/upload only, no channel name
+            parts = meta_rows[0].get("metadataParts", [])
+            if len(parts) > 0:
+                views = parts[0].get("text", {}).get("content", "")
+            if len(parts) > 1:
+                upload_time = parts[1].get("text", {}).get("content", "")
+        elif len(meta_rows) >= 2:
+            # Playlists: row 0 = channel name, row 1 = views/upload
+            parts0 = meta_rows[0].get("metadataParts", [])
+            if parts0:
+                channel_name = parts0[0].get("text", {}).get("content", "")
+
+            parts1 = meta_rows[1].get("metadataParts", [])
+            if len(parts1) > 0:
+                views = parts1[0].get("text", {}).get("content", "")
+            if len(parts1) > 1:
+                upload_time = parts1[1].get("text", {}).get("content", "")
+
+        badge_style = _safe_get(
+            lockup_view, "contentImage", "thumbnailViewModel", "overlays", 0,
+            "thumbnailBottomOverlayViewModel", "badges", 0,
+            "thumbnailBadgeViewModel", "badgeStyle",
+        )
+        is_live = badge_style == "THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE"
+
+        result = {
+            "videoId": video_id,
+            # Keep both shapes: wrapper.py in script.module.scrapetube reads
+            # title['runs'][0]['text']; newer callers can use title_text.
+            "title": {"simpleText": title, "runs": [{"text": title}]},
+            "is_live": is_live,
+        }
+
+        if thumbnail_url:
+            result["thumbnail"] = {"thumbnails": [{"url": thumbnail_url}]}
+        if channel_name:
+            result["shortBylineText"] = {"simpleText": channel_name}
+        if views:
+            result["viewCountText"] = {"simpleText": views}
+        if upload_time:
+            result["publishedTimeText"] = {"simpleText": upload_time}
+
+        return result
+
+    except (KeyError, TypeError, AttributeError, IndexError):
+        pass
+
+    return None
+
+def parse_shorts_lockup_format(rich_item: dict) -> dict:
+    """Parse shortsLockupViewModel format (Shorts)."""
+    try:
+        content = rich_item.get("content", {})
+        shorts_lockup = content.get("shortsLockupViewModel", {})
+
+        if not shorts_lockup:
+            return None
+
+        video_id = None
+        for endpoint in search_dict(shorts_lockup, "reelWatchEndpoint"):
+            video_id = endpoint.get("videoId")
+            if video_id:
+                break
+
+        if not video_id:
+            return None
+
+        overlay_metadata = shorts_lockup.get("overlayMetadata", {})
+        title = overlay_metadata.get("primaryText", {}).get("content", "")
+        views = overlay_metadata.get("secondaryText", {}).get("content", "")
+
+        return {
+            "videoId": video_id,
+            "title": {"simpleText": title, "runs": [{"text": title}]},
+            "viewCountText": {"simpleText": views},
+            "isShort": True,
+            "is_live": False,
+        }
+
+    except (KeyError, TypeError, AttributeError):
+        pass
+
+    return None
 
 def get_videos_items(data: dict, selector: str) -> Generator[dict, None, None]:
-    return search_dict(data, selector)
+    """Get video items, handling both old and new YouTube formats."""
+
+    if selector in ("videoRenderer", "playlistVideoRenderer"):
+        rich_items = list(search_dict(data, "richItemRenderer"))
+        yielded_any = False
+
+        if rich_items:
+            for rich_item in rich_items:
+                video_data = parse_rich_item_new_format(rich_item)
+                if video_data:
+                    yielded_any = True
+                    yield video_data
+                    continue
+                video_data = parse_shorts_lockup_format(rich_item)
+                if video_data:
+                    yielded_any = True
+                    yield video_data
+
+        if yielded_any:
+            return
+
+        lockup_items = list(search_dict(data, "lockupViewModel"))
+        if lockup_items:
+            for lockup_view in lockup_items:
+                video_data = parse_lockup_view_model(lockup_view)
+                if video_data:
+                    yielded_any = True
+                    yield video_data
+
+        if yielded_any:
+            return
+
+        for video in search_dict(data, selector):
+            yield video
+    else:
+        for item in search_dict(data, selector):
+            yield item
+
+
+def _safe_get(obj, *keys, default=None):
+    for key in keys:
+        try:
+            obj = obj[key]
+        except Exception:
+            return default
+    return obj
+
+
+def _enrich_channel_item(item: dict) -> dict:
+    """Additive convenience fields (ahai72160 idea, non-breaking).
+
+    Keeps the original ``title`` dict intact and adds ``title_text: str``
+    plus ``is_live: bool``. ``videoId`` is preserved as-is.
+    """
+    if "is_live" not in item:
+        is_live = False
+        if (
+            _safe_get(
+                item, "thumbnailOverlays", 0,
+                "thumbnailOverlayTimeStatusRenderer", "style",
+            )
+            == "LIVE"
+        ):
+            is_live = True
+        item["is_live"] = is_live
+    title = item.get("title")
+    if isinstance(title, dict):
+        item["title_text"] = title.get("simpleText") or _safe_get(
+            title, "runs", 0, "text", default=""
+        )
+    elif isinstance(title, str):
+        item["title_text"] = title
+    else:
+        item["title_text"] = ""
+    return item
