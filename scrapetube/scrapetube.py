@@ -1,6 +1,7 @@
+import hashlib
 import json
 import time
-from typing import Generator
+from typing import Generator, Union
 
 import requests
 
@@ -24,6 +25,7 @@ def get_channel(
     proxies: dict = None,
     sort_by: Literal["newest", "oldest", "popular"] = "newest",
     content_type: Literal["videos", "shorts", "streams"] = "videos",
+    cookies: Union[dict, str] = None,
 ) -> Generator[dict, None, None]:
 
     """Get videos for a channel.
@@ -68,6 +70,12 @@ def get_channel(
 
     Each yielded item keeps the upstream dict shape and additionally provides
     ``title_text`` (``str``) and ``is_live`` (``bool``) for convenience.
+
+        cookies (``dict`` or ``str``, *optional*):
+            Login cookies to access your own content, including private
+            videos. Either a dict (``{'SID': '...', ...}``) or a
+            ``"name=value; name2=value2"`` header string, e.g. copied
+            from a logged-in browser session. Keep these secret.
     """
 
     base_url = ""
@@ -83,12 +91,13 @@ def get_channel(
         content_type=content_type,
     )
     api_endpoint = "https://www.youtube.com/youtubei/v1/browse"
-    videos = get_videos(url, api_endpoint, "contents", type_property_map[content_type], limit, sleep, proxies, sort_by, content_type)
+    videos = get_videos(url, api_endpoint, "contents", type_property_map[content_type], limit, sleep, proxies, sort_by, content_type, cookies)
     for video in videos:
         yield video
 
 def get_playlist(
-    playlist_id: str, limit: int = None, sleep: int = 1, proxies: dict = None
+    playlist_id: str, limit: int = None, sleep: int = 1, proxies: dict = None,
+    cookies: Union[dict, str] = None,
 ) -> Generator[dict, None, None]:
 
     """Get videos for a playlist.
@@ -107,6 +116,10 @@ def get_playlist(
         proxies (``dict``, *optional*):
             A dictionary with the proxies you want to use. Ex:
             ``{'https': 'http://username:password@101.102.103.104:3128'}``
+
+        cookies (``dict`` or ``str``, *optional*):
+            Login cookies to access private playlists. Dict or
+            ``"name=value; ..."`` string. Keep these secret.
     """
 
     url = f"https://www.youtube.com/playlist?list={playlist_id}"
@@ -116,7 +129,8 @@ def get_playlist(
     # container to "itemSectionRenderer" wrapping richItemRenderer/lockupViewModel
     # nodes. The old selector no longer matches anything on current pages.
     videos = get_videos(
-        url, api_endpoint, "itemSectionRenderer", "playlistVideoRenderer", limit, sleep, proxies
+        url, api_endpoint, "itemSectionRenderer", "playlistVideoRenderer", limit, sleep, proxies,
+        cookies=cookies,
     )
     for video in videos:
         yield video
@@ -128,6 +142,7 @@ def get_search(
     sort_by: Literal["relevance", "upload_date", "view_count", "rating"] = "relevance",
     results_type: Literal["video", "channel", "playlist", "movie"] = "video",
     proxies: dict = None,
+    cookies: Union[dict, str] = None,
 ) -> Generator[dict, None, None]:
 
     """Search youtube and get videos.
@@ -158,6 +173,10 @@ def get_search(
         proxies (``dict``, *optional*):
             A dictionary with the proxies you want to use. Ex:
             ``{'https': 'http://username:password@101.102.103.104:3128'}``
+
+        cookies (``dict`` or ``str``, *optional*):
+            Login cookies for authenticated search. Dict or
+            ``"name=value; ..."`` string. Keep these secret.
     """
 
     sort_by_map = {
@@ -178,13 +197,15 @@ def get_search(
     url = f"https://www.youtube.com/results?search_query={query}&sp={param_string}"
     api_endpoint = "https://www.youtube.com/youtubei/v1/search"
     videos = get_videos(
-        url, api_endpoint, "contents", results_type_map[results_type][1], limit, sleep, proxies
+        url, api_endpoint, "contents", results_type_map[results_type][1], limit, sleep, proxies,
+        cookies=cookies,
     )
     for video in videos:
         yield video
 
 def get_video(
     id: str,
+    cookies: Union[dict, str] = None,
 ) -> dict:
 
     """Get a single video.
@@ -192,9 +213,13 @@ def get_video(
     Parameters:
         id (``str``):
             The video id from the video you want to get.
+
+        cookies (``dict`` or ``str``, *optional*):
+            Login cookies to access private videos. Dict or
+            ``"name=value; ..."`` string. Keep these secret.
     """
 
-    session = get_session()
+    session = get_session(cookies=cookies)
     url = f"https://www.youtube.com/watch?v={id}"
     html = get_initial_data(session, url)
     client = json.loads(
@@ -208,9 +233,9 @@ def get_video(
     return next(search_dict(data, "videoPrimaryInfoRenderer"))
 
 def get_videos(
-    url: str, api_endpoint: str, selector_list: str, selector_item: str, limit: int, sleep: float, proxies: dict = None, sort_by: str = None, content_type: str = None
+    url: str, api_endpoint: str, selector_list: str, selector_item: str, limit: int, sleep: float, proxies: dict = None, sort_by: str = None, content_type: str = None, cookies: Union[dict, str] = None
 ) -> Generator[dict, None, None]:
-    session = get_session(proxies)
+    session = get_session(proxies, cookies)
     is_first = True
     quit_it = False
     count = 0
@@ -294,10 +319,59 @@ def get_videos(
 
     session.close()
 
-def get_session(proxies: dict = None) -> requests.Session:
+def _parse_cookies(cookies: Union[dict, str]) -> dict:
+    """Normalize user-supplied cookies to a dict.
+
+    Accepts a ``dict`` as-is or a ``"name=value; ..."`` header string
+    as copied from browser devtools. Returns an empty dict for ``None``.
+    """
+    if not cookies:
+        return {}
+    if isinstance(cookies, dict):
+        return dict(cookies)
+    if isinstance(cookies, str):
+        parsed = {}
+        for part in cookies.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, _, value = part.partition("=")
+            name, value = name.strip(), value.strip()
+            if name:
+                parsed[name] = value
+        return parsed
+    raise TypeError("cookies must be a dict or 'name=value; ...' string")
+
+
+def _get_auth_headers(session: requests.Session) -> dict:
+    """Build YouTube SAPISIDHASH auth headers when logged in.
+
+    Authenticated ``youtubei/v1`` POSTs (continuations) need
+    ``Authorization: SAPISIDHASH <ts>_<sha1>`` derived from the SAPISID
+    cookie. Returns {} for anonymous sessions.
+    """
+    try:
+        sapisid = session.cookies.get("SAPISID")
+    except Exception:
+        sapisid = None
+    if not sapisid:
+        return {}
+    origin = "https://www.youtube.com"
+    timestamp = int(time.time())
+    token = f"{timestamp} {sapisid} {origin}"
+    digest = hashlib.sha1(token.encode("utf-8")).hexdigest()
+    return {
+        "Authorization": f"SAPISIDHASH {timestamp}_{digest}",
+        "X-Origin": origin,
+    }
+
+
+def get_session(proxies: dict = None, cookies: Union[dict, str] = None) -> requests.Session:
     session = requests.Session()
     if proxies:
         session.proxies.update(proxies)
+    for name, value in _parse_cookies(cookies).items():
+        session.cookies.set(name, value, domain=".youtube.com")
     session.headers[
         "User-Agent"
     ] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
@@ -307,7 +381,8 @@ def get_session(proxies: dict = None) -> requests.Session:
     return session
 
 def get_initial_data(session: requests.Session, url: str) -> str:
-    session.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
+    if not session.cookies.get("CONSENT"):
+        session.cookies.set("CONSENT", "YES+cb", domain=".youtube.com")
     response = session.get(url, params={"ucbcb":1})
     html = response.text
     return html
@@ -323,7 +398,10 @@ def get_ajax_data(
         "context": {"clickTracking": next_data["click_params"], "client": client},
         "continuation": next_data["token"],
     }
-    response = session.post(api_endpoint, params={"key": api_key}, json=data)
+    response = session.post(
+        api_endpoint, params={"key": api_key}, json=data,
+        headers=_get_auth_headers(session),
+    )
     return response.json()
 
 def get_json_from_html(html: str, key: str, num_chars: int = 2, stop: str = '"') -> str:
