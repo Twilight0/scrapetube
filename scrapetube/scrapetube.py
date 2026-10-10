@@ -1,14 +1,21 @@
 import hashlib
 import json
+import re
 import time
 from typing import Generator, Union
 
 import requests
 
 try:
-    from typing_extensions import Literal
-except ImportError:  # Kodi / minimal envs without typing_extensions
-    Literal = str
+    from typing import Literal
+except ImportError:
+    try:
+        from typing_extensions import Literal
+    except ImportError:  # Kodi / minimal envs without typing_extensions
+        class _LiteralType:
+            def __getitem__(self, item):
+                return str
+        Literal = _LiteralType()
 
 type_property_map = {
     "videos": "videoRenderer",
@@ -234,6 +241,68 @@ def get_video(
             "(page layout changed or login expired)"
         )
     return next(search_dict(data, "videoPrimaryInfoRenderer"))
+
+
+def _extract_player_response(html: str):
+    """Parse ``ytInitialPlayerResponse`` from a watch page.
+
+    Returns the parsed dict, or ``None`` when the page carries none
+    (private/deleted video, consent wall or layout change).
+    """
+    match = re.search(
+        r"var ytInitialPlayerResponse\s*=\s*(\{.*?\});(?:var|</script>)",
+        html, re.DOTALL,
+    )
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except ValueError:
+            pass
+    data = _extract_yt_initial_data(html)
+    if isinstance(data, dict):
+        player = data.get("playerResponse")
+        if isinstance(player, dict):
+            return player
+    return None
+
+
+def get_video_details(
+    id: str,
+    cookies: Union[dict, str] = None,
+) -> dict:
+
+    """Get full metadata for a single video, including its description.
+
+    Parameters:
+        id (``str``):
+            The video id from the video you want to get.
+
+        cookies (``dict`` or ``str``, *optional*):
+            Login cookies to access private videos. Dict or
+            ``"name=value; ..."`` string. Keep these secret.
+
+    Returns the ``videoDetails`` record: ``title``, ``shortDescription``,
+    ``keywords``, ``lengthSeconds``, ``viewCount``, ``author``,
+    ``channelId``, ``thumbnail`` plus ``isLiveContent``/``isPrivate`` flags.
+    """
+
+    session = get_session(cookies=cookies)
+    url = f"https://www.youtube.com/watch?v={id}"
+    html = get_initial_data(session, url)
+    player = _extract_player_response(html)
+    if not player and "INNERTUBE_CONTEXT" not in html:
+        # Throttled/stub page under load: one retry before giving up.
+        time.sleep(1)
+        html = get_initial_data(session, url)
+        player = _extract_player_response(html)
+    if not player:
+        raise RuntimeError(
+            "Could not find player data in YouTube response "
+            "(private/deleted video, login expired or layout changed)"
+        )
+    details = player.get("videoDetails") or {}
+    session.close()
+    return details
 
 def get_videos(
     url: str, api_endpoint: str, selector_list: str, selector_item: str, limit: int, sleep: float, proxies: dict = None, sort_by: str = None, content_type: str = None, cookies: Union[dict, str] = None
@@ -533,7 +602,14 @@ def get_next_data(data: dict, sort_by: str = None) -> dict:
     if not endpoint:
         return None
 
-    token = endpoint["continuationCommand"]["token"]
+    continuation_cmd = endpoint.get("continuationCommand")
+    if not continuation_cmd:
+        continuation_cmd = next(search_dict(endpoint, "continuationCommand"), None)
+
+    if not continuation_cmd or "token" not in continuation_cmd:
+        return None
+
+    token = continuation_cmd["token"]
     next_data = {
         "token": token,
         "click_params": {"clickTrackingParams": endpoint.get("clickTrackingParams")},
@@ -567,12 +643,21 @@ def parse_lockup_view_model(lockup_view: dict) -> dict:
     """Parse a lockupViewModel dict directly (used by both channels and playlists)."""
     try:
         # Try the simple, direct approach first, get videoId from contentId
-        video_id = lockup_view.get("contentId")
+        content_id = lockup_view.get("contentId")
         content_type = lockup_view.get("contentType", "")
+
+        if content_type == "LOCKUP_CONTENT_TYPE_PLAYLIST":
+            # Playlists carry the id in contentId (PL...) — no videoId.
+            # Defer metadata parsing to the playlist branch below.
+            if content_id:
+                return {"playlistId": content_id, "contentType": content_type}
+            return None
 
         # Only proceed if this is actually a video
         if content_type and content_type != "LOCKUP_CONTENT_TYPE_VIDEO":
             return None
+
+        video_id = content_id
 
         # Fallback: search for watchEndpoint if still no videoId
         if not video_id:
@@ -689,8 +774,43 @@ def parse_shorts_lockup_format(rich_item: dict) -> dict:
 
     return None
 
+def _enrich_playlist_lockup(lockup_view: dict, parsed: dict) -> dict:
+    """Attach title/thumbnail/channel to a playlist lockup stub."""
+    metadata = lockup_view.get("metadata", {}).get("lockupMetadataViewModel", {})
+    title = metadata.get("title", {}).get("content", "")
+    if title:
+        parsed["title"] = {"simpleText": title, "runs": [{"text": title}]}
+        parsed["title_text"] = title
+    sources = _safe_get(
+        lockup_view, "contentImage", "collectionThumbnailViewModel",
+        "primaryThumbnail", "thumbnailViewModel", "image", "sources", default=[],
+    ) or []
+    if sources:
+        parsed["thumbnail"] = {"thumbnails": [{"url": sources[-1].get("url", "")}]}
+    rows = metadata.get("metadata", {}).get(
+        "contentMetadataViewModel", {}).get("metadataRows", [])
+    if rows:
+        channel = rows[0].get("metadataParts", [{}])[0].get("text", {}).get("content", "")
+        if channel:
+            parsed["shortBylineText"] = {"simpleText": channel}
+    parsed["is_live"] = False
+    return parsed
+
+
 def get_videos_items(data: dict, selector: str) -> Generator[dict, None, None]:
     """Get video items, handling both old and new YouTube formats."""
+    if selector == "playlistRenderer":
+        # Current search layout serves playlists as lockupViewModel nodes
+        # (contentType LOCKUP_CONTENT_TYPE_PLAYLIST); legacy playlistRenderer
+        # nodes no longer appear on search pages.
+        for lockup_view in search_dict(data, "lockupViewModel"):
+            if lockup_view.get("contentType") != "LOCKUP_CONTENT_TYPE_PLAYLIST":
+                continue
+            parsed = parse_lockup_view_model(lockup_view)
+            if not parsed:
+                continue
+            yield _enrich_playlist_lockup(lockup_view, parsed)
+        return
 
     if selector in ("videoRenderer", "playlistVideoRenderer"):
         rich_items = list(search_dict(data, "richItemRenderer"))
