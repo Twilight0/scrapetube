@@ -799,10 +799,10 @@ def _enrich_playlist_lockup(lockup_view: dict, parsed: dict) -> dict:
 
 def get_videos_items(data: dict, selector: str) -> Generator[dict, None, None]:
     """Get video items, handling both old and new YouTube formats."""
-    if selector == "playlistRenderer":
-        # Current search layout serves playlists as lockupViewModel nodes
-        # (contentType LOCKUP_CONTENT_TYPE_PLAYLIST); legacy playlistRenderer
-        # nodes no longer appear on search pages.
+    if selector in ("playlistRenderer", "gridPlaylistRenderer"):
+        # Current search AND channel-tab layouts serve playlists as
+        # lockupViewModel nodes (contentType LOCKUP_CONTENT_TYPE_PLAYLIST);
+        # legacy playlistRenderer/gridPlaylistRenderer nodes no longer appear.
         for lockup_view in search_dict(data, "lockupViewModel"):
             if lockup_view.get("contentType") != "LOCKUP_CONTENT_TYPE_PLAYLIST":
                 continue

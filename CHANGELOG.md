@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.8.4
+- Channel playlists tab: parse `lockupViewModel` playlist nodes for the
+  `gridPlaylistRenderer` selector (same treatment as search).
+
 ## 2.8.3
 - New `get_video_details(id, cookies)`: full `videoDetails` record (title,
   `shortDescription`, keywords, length, views, author, thumbnails,
